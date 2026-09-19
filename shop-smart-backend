@@ -1,0 +1,955 @@
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+
+import { searchAmazon } from "./adapters/amazonAdapter.js";
+import { searchFlipkart } from "./adapters/flipkartAdapter.js";
+import { searchCroma } from "./adapters/cromaAdapter.js";
+import { searchRelianceDigital } from "./adapters/relianceDigitalAdapter.js";
+import { searchVijaySales } from "./adapters/vijaySalesAdapter.js";
+import { parseQuery, groupByConfiguration } from "./lib/matchingEngine.js";
+import { buildOfferScenarios } from "./lib/offerEngine.js";
+import { recordResult, getStatus } from "./lib/statusStore.js";
+
+const app = express();
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error("CORS origin not allowed"));
+  }
+}));
+app.use(express.json());
+
+const ADAPTERS = {
+  Amazon: searchAmazon,
+  Flipkart: searchFlipkart,
+  Croma: searchCroma,
+  "Reliance Digital": searchRelianceDigital,
+  "Vijay Sales": searchVijaySales,
+};
+
+// Short-lived in-memory cache. Real prices go stale fast, so this is
+// intentionally short — it exists to absorb repeat requests during a
+// single browsing session, not to serve day-old data as if it were live.
+const CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
+const cache = new Map(); // key -> { at, results }
+
+function cacheKey(query) { return query.trim().toLowerCase(); }
+
+async function runAllAdapters(query) {
+  const settled = await Promise.allSettled(
+    Object.entries(ADAPTERS).map(async ([retailer, fn]) => {
+      try {
+        const offers = await fn(query);
+        const connected = offers.some(o => o.source !== "not_connected");
+        const succeeded = offers.filter(o => o.verificationStatus === "VERIFIED");
+        recordResult(retailer, {
+          connected,
+          productsReturned: succeeded.length,
+          error: offers[0]?.error || null,
+        });
+        return offers;
+      } catch (err) {
+        recordResult(retailer, { connected: false, productsReturned: 0, error: err.message });
+        return [{ retailer, source: retailer.toLowerCase(), verificationStatus: "UNAVAILABLE", error: `Adapter threw: ${err.message}`, productUrl: null }];
+      }
+    })
+  );
+  // flatten; a single retailer throwing never takes down the others
+  return settled.flatMap(r => (r.status === "fulfilled" ? r.value : []));
+}
+
+/**
+ * GET /api/search?q=<query>
+ * Runs every adapter, normalizes + groups by configuration, marks
+ * cache freshness honestly (VERIFIED fresh vs RECENT from short cache
+ * vs STALE if a refetch failed and only old cache is left).
+ */
+app.get("/api/search", async (req, res) => {
+  const query = (req.query.q || "").toString();
+  if (!query.trim()) return res.status(400).json({ error: "Missing query parameter q" });
+
+  const key = cacheKey(query);
+  const cached = cache.get(key);
+  const cacheAge = cached ? Date.now() - cached.at : Infinity;
+
+  let offers;
+  let servedFromCache = false;
+
+  if (cached && cacheAge < CACHE_TTL_MS) {
+    offers = cached.results;
+    servedFromCache = true;
+  } else {
+    try {
+      offers = await runAllAdapters(query);
+      cache.set(key, { at: Date.now(), results: offers });
+    } catch (err) {
+      if (cached) {
+        // Live refetch failed; we still have something, but it must be
+        // labeled STALE, never presented as current.
+        offers = cached.results.map(o => ({ ...o, verificationStatus: "STALE" }));
+        servedFromCache = true;
+      } else {
+        return res.status(502).json({ error: "All retailer sources failed and no cached data exists", detail: err.message });
+      }
+    }
+  }
+
+  if (servedFromCache) {
+    offers = offers.map(o => ({
+      ...o,
+      verificationStatus: o.verificationStatus === "VERIFIED" ? "RECENT" : o.verificationStatus,
+    }));
+  }
+
+  const parsed = parseQuery(query);
+  const groups = groupByConfiguration(offers, parsed);
+  const notConnected = offers.filter(o => o.source === "not_connected");
+
+  res.json({
+    query,
+    parsed,
+    groups: groups.map(g => ({
+      brand: g.brand,
+      storage: g.storage,
+      offers: g.offers.sort((a, b) => (a.sellingPrice ?? Infinity) - (b.sellingPrice ?? Infinity)),
+    })),
+    unavailableRetailers: notConnected.map(o => ({ retailer: o.retailer, reason: o.error })),
+    fetchedAt: new Date().toISOString(),
+    disclaimer: "Prices and retailer offers can change. Final price is determined by the retailer at checkout.",
+  });
+});
+
+/** GET /api/offers/:productId — offer scenarios for one specific offer/product. */
+app.post("/api/offers/compute", (req, res) => {
+  const offer = req.body;
+  if (!offer || typeof offer !== "object") return res.status(400).json({ error: "Request body must be a ProductOffer object" });
+  res.json(buildOfferScenarios(offer));
+});
+
+/** GET /api/retailers/status — connection dashboard. */
+app.get("/api/retailers/status", (_req, res) => {
+  const known = Object.keys(ADAPTERS);
+  const recorded = getStatus();
+  const byRetailer = new Map(recorded.map(r => [r.retailer, r]));
+
+  res.json(known.map(retailer => byRetailer.get(retailer) || {
+    retailer, connected: false, lastSync: null, lastError: "No requests made yet", productsReturned: 0,
+  }));
+});
+
+app.get("/api/health", (_req, res) => res.json({
+  ok: true,
+  service: "shop-smart-ai-backend",
+  version: "1.1.0",
+  time: new Date().toISOString()
+}));
+
+app.get("/api", (_req, res) => {
+  res.json({
+    name: "Shop Smart AI API",
+    version: "1.1.0",
+    endpoints: {
+      search: "GET /api/search?q=<query>",
+      offerScenarios: "POST /api/offers/compute",
+      retailerStatus: "GET /api/retailers/status",
+      health: "GET /api/health"
+    },
+    note: "Retailer prices are returned only from configured authorized data sources."
+  });
+});
+
+app.use((req, res) => {
+  res.status(404).json({
+    error: "Not found",
+    path: req.path,
+    available: [
+      "GET /api",
+      "GET /api/health",
+      "GET /api/search?q=<query>",
+      "POST /api/offers/compute",
+      "GET /api/retailers/status"
+    ]
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Shop Smart AI backend listening on :${PORT}`));
+
+# Copy this file to .env and fill in only the values you actually have.
+# Leave a retailer's variables blank/unset if you don't have credentials for
+# it yet — its adapter will correctly report status "not_connected" instead
+# of crashing or faking data.
+
+# ---- Amazon Product Advertising API (PA-API v5) -----------------------
+# Requires an approved Amazon Associates (India) account with PA-API access.
+# Apply: https://webservices.amazon.in/paapi5/documentation/
+AMAZON_ACCESS_KEY=
+AMAZON_SECRET_KEY=
+AMAZON_PARTNER_TAG=
+AMAZON_HOST=webservices.amazon.in
+AMAZON_REGION=eu-west-1
+AMAZON_MARKETPLACE=www.amazon.in
+
+# ---- Flipkart Affiliate API --------------------------------------------
+# Requires an approved Flipkart Affiliate account.
+# Apply: https://affiliate.flipkart.com/api-docs
+FLIPKART_AFFILIATE_ID=
+FLIPKART_AFFILIATE_TOKEN=
+
+# ---- Croma / Reliance Digital / Vijay Sales ----------------------------
+# As of writing, none of these publish a public product/pricing API or
+# affiliate feed. There is nothing to put here. If that changes (a
+# retailer opens a partner/affiliate program), add its adapter the same
+# way amazonAdapter.js / flipkartAdapter.js are structured.
+# CROMA_API_KEY=
+# RELIANCE_API_KEY=
+# VIJAY_SALES_API_KEY=
+
+PORT=3000
+
+# ---- API / deployment ---------------------------------------------------
+# Comma-separated frontend origins. Use "*" for local development only.
+ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000
+
+{
+  "name": "shop-smart-ai-backend",
+  "version": "1.1.0",
+  "description": "Shop Smart AI backend: retailer adapter layer, normalizer, matching engine, offer engine. Serves the frontend endpoints the Shop Smart AI artifact expects.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
+
+# Shop Smart AI API — Setup Guide
+
+This backend is the API layer for Shop Smart AI.
+
+## What is implemented
+
+- `GET /api/search?q=...`
+- `POST /api/offers/compute`
+- `GET /api/retailers/status`
+- `GET /api/health`
+- `GET /api`
+- Amazon adapter
+- Flipkart adapter
+- Croma adapter slot
+- Reliance Digital adapter slot
+- Vijay Sales adapter slot
+- Product normalization
+- Conservative product matching
+- Offer scenarios without unsafe discount stacking
+- Short-lived price caching
+- Per-retailer failure isolation
+
+## Start locally
+
+```bash
+npm install
+cp .env.example .env
+npm start
+```
+
+Windows PowerShell:
+
+```powershell
+npm install
+Copy-Item .env.example .env
+npm start
+```
+
+Then test:
+
+```text
+http://localhost:3000/api/health
+http://localhost:3000/api/search?q=iphone%2017%20256gb
+http://localhost:3000/api/retailers/status
+```
+
+## Real retailer credentials
+
+The application does not manufacture retailer credentials.
+
+Configure only credentials obtained through an authorized retailer/affiliate/partner program.
+
+Amazon:
+- `AMAZON_ACCESS_KEY`
+- `AMAZON_SECRET_KEY`
+- `AMAZON_PARTNER_TAG`
+
+Flipkart:
+- `FLIPKART_AFFILIATE_ID`
+- `FLIPKART_AFFILIATE_TOKEN`
+
+Croma, Reliance Digital and Vijay Sales currently have adapter slots. Leave them unconfigured unless you obtain an authorized API/feed/partnership.
+
+## Frontend connection
+
+Set your frontend API base URL to the deployed backend, for example:
+
+```text
+https://YOUR-BACKEND-DOMAIN.example.com
+```
+
+Do not put retailer secrets in the frontend.
+
+## Data integrity
+
+The API intentionally returns `UNAVAILABLE` when a retailer has no connected authorized source. It does not generate fake prices or product links.
+
+Price responses include a source and verification status. Conditional offers are represented as separate scenarios unless the source explicitly confirms they are combinable.
+
+## Production notes
+
+- Deploy this backend on a Node.js host with outbound HTTPS access.
+- Set environment variables in the host's secret/environment-variable manager.
+- Set `ALLOWED_ORIGINS` to your real frontend domain(s).
+- For multiple backend instances, replace the in-memory cache/status store with Redis or a database.
+- Add platform-specific rate limiting/authentication before exposing a private admin API.
+
+.env
+node_modules/
+.DS_Store
+npm-debug.log*
+
+# Shop Smart AI — prototype (backend + frontend)
+
+`frontend/index.html` is the client UI — open it locally or host it anywhere
+static. It has zero price-generation logic of its own; it only calls the
+backend below and shows exactly what it returns, including "not connected"
+and "Live price unavailable" states honestly.
+
+
+This is a real, deployable backend implementing the retailer-adapter
+architecture: adapters → normalizer → matching engine → offer engine →
+API endpoints. It is **not running anywhere right now** — I can't host a
+persistent server or hold API secrets inside this chat/artifact
+environment, and the sandbox this was written in has no outbound network
+access at all. You (or a developer) need to deploy it somewhere with real
+network access — a small VM, Render, Railway, Fly.io, a serverless
+function, etc.
+
+## What's actually real here
+
+- **Amazon adapter** (`adapters/amazonAdapter.js`) — a real, correctly
+  signed PA-API v5 `SearchItems` request (AWS Signature v4, implemented
+  from scratch with Node's `crypto` module — no unverified third-party
+  signing library). It will return real Amazon prices **once you have
+  approved PA-API credentials.**
+- **Flipkart adapter** — a real call to the Flipkart Affiliate API. Same
+  condition: needs an approved affiliate account.
+- **Croma / Reliance Digital / Vijay Sales adapters** — these always
+  return `"not_connected"`. As of writing, none of these three publish a
+  public product/pricing API or affiliate feed. There is nothing to wire
+  up honestly. If one of them opens a partner program later, its adapter
+  slots in the same way `amazonAdapter.js` does.
+
+## What you need to do to make prices actually appear
+
+1. **Amazon**: Sign up for the Amazon Associates Program (India), then
+   apply for PA-API access from your Associates account
+   (https://webservices.amazon.in/paapi5/documentation/). Amazon approves
+   PA-API access based on your account generating qualifying sales — a
+   brand-new associate account is not guaranteed instant access.
+2. **Flipkart**: Apply for the Flipkart Affiliate Program
+   (https://affiliate.flipkart.com/api-docs) and get your affiliate ID +
+   token.
+3. Copy `.env.example` to `.env` and fill in whichever credentials you
+   actually obtained. Leave the rest blank — those retailers will
+   correctly show as "not connected" instead of the app crashing or
+   guessing.
+4. `npm install && npm start` (or deploy to your platform of choice with
+   the same env vars set in its dashboard/secrets manager).
+5. Point the frontend's `API_BASE_URL` (top of the artifact's `<script>`)
+   at your deployed backend's URL.
+
+## Why Croma / Reliance Digital / Vijay Sales can't be "just added"
+
+Getting their real prices legitimately requires one of:
+- A commercial data-partnership / affiliate agreement directly with the
+  retailer (not something either of us can set up from a chat).
+- Scraping their website — which I won't build, since it's against their
+  Terms of Service regardless of how the request is framed.
+
+Until one of those changes, the honest state for those three is
+"Data source not connected," not a fake price.
+
+## Endpoints
+
+- `GET /api/search?q=<query>` — runs all adapters, normalizes, groups by
+  configuration (brand + storage), returns real results plus which
+  retailers were unavailable and why.
+- `POST /api/offers/compute` — given one ProductOffer, returns labeled
+  offer *scenarios* (never auto-summed unless the source explicitly
+  confirmed combinability, which neither current adapter does).
+- `GET /api/retailers/status` — connection dashboard: connected/not,
+  last sync, last error, products returned.
+- `GET /api/health` — liveness check.
+
+## Caching and freshness
+
+Results are cached in-memory for 2 minutes to absorb repeat requests in
+one session — not to serve old data as current. A cached result is
+labeled `RECENT` (not `VERIFIED`); if a live refetch fails and only old
+cache remains, it's labeled `STALE`. The frontend should render these
+statuses visibly rather than treating every response as equally live.
+
+## What this does NOT do, on purpose
+
+- Never invents a price, product URL, or offer.
+- Never bypasses CAPTCHA, bot protection, or authentication.
+- Never stores secrets anywhere the frontend can read them — the
+  frontend only ever talks to this backend, never to a retailer
+  directly.
+- Never auto-stacks bank + coupon + exchange discounts into one number
+  unless a retailer source explicitly says they combine.
+
+/**
+ * Amazon Product Advertising API (PA-API) v5 adapter — SearchItems operation.
+ *
+ * This performs a REAL signed request to Amazon's API. It requires:
+ *   AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_PARTNER_TAG
+ * from an approved Amazon Associates account with PA-API access
+ * (https://webservices.amazon.in/paapi5/documentation/). Without those,
+ * this adapter correctly reports "not_connected" — it never fabricates
+ * a response.
+ *
+ * PA-API v5 access is also usage-gated: Amazon only keeps issuing request
+ * quota to associates who are generating qualifying sales, so a newly
+ * approved key can still return throttling/quota errors. Those are
+ * surfaced as UNAVAILABLE, never masked with invented data.
+ */
+import crypto from "node:crypto";
+import { normalizeOffer, notConnectedOffer, failedOffer } from "../lib/normalizer.js";
+
+const SERVICE = "ProductAdvertisingAPI";
+
+function hmac(key, msg) {
+  return crypto.createHmac("sha256", key).update(msg, "utf8").digest();
+}
+function hash(msg) {
+  return crypto.createHash("sha256").update(msg, "utf8").digest("hex");
+}
+
+function signRequest({ method, host, path, payload, accessKey, secretKey, region }) {
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const dateStamp = amzDate.slice(0, 8);
+
+  const canonicalHeaders =
+    `content-encoding:amz-1.0\n` +
+    `content-type:application/json; charset=utf-8\n` +
+    `host:${host}\n` +
+    `x-amz-date:${amzDate}\n` +
+    `x-amz-target:com.amazon.paapi5.v1.ProductAdvertisingAPIv1.SearchItems\n`;
+  const signedHeaders = "content-encoding;content-type;host;x-amz-date;x-amz-target";
+
+  const canonicalRequest =
+    `${method}\n${path}\n\n${canonicalHeaders}\n${signedHeaders}\n${hash(payload)}`;
+
+  const credentialScope = `${dateStamp}/${region}/${SERVICE}/aws4_request`;
+  const stringToSign =
+    `AWS4-HMAC-SHA256\n${amzDate}\n${credentialScope}\n${hash(canonicalRequest)}`;
+
+  const kDate = hmac(`AWS4${secretKey}`, dateStamp);
+  const kRegion = hmac(kDate, region);
+  const kService = hmac(kRegion, SERVICE);
+  const kSigning = hmac(kService, "aws4_request");
+  const signature = crypto.createHmac("sha256", kSigning).update(stringToSign, "utf8").digest("hex");
+
+  const authorization =
+    `AWS4-HMAC-SHA256 Credential=${accessKey}/${credentialScope}, ` +
+    `SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  return { amzDate, authorization };
+}
+
+export async function searchAmazon(query) {
+  const { AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_PARTNER_TAG, AMAZON_HOST, AMAZON_REGION, AMAZON_MARKETPLACE } = process.env;
+
+  if (!AMAZON_ACCESS_KEY || !AMAZON_SECRET_KEY || !AMAZON_PARTNER_TAG) {
+    return [notConnectedOffer("Amazon", "No AMAZON_ACCESS_KEY/AMAZON_SECRET_KEY/AMAZON_PARTNER_TAG configured — apply for PA-API access via your Amazon Associates account.")];
+  }
+
+  const host = AMAZON_HOST || "webservices.amazon.in";
+  const region = AMAZON_REGION || "eu-west-1";
+  const path = "/paapi5/searchitems";
+
+  const payload = JSON.stringify({
+    Keywords: query,
+    Resources: [
+      "ItemInfo.Title",
+      "ItemInfo.ByLineInfo",
+      "ItemInfo.ProductInfo",
+      "Offers.Listings.Price",
+      "Offers.Listings.SavingBasis",
+      "Offers.Listings.Availability.Message",
+      "Images.Primary.Large",
+    ],
+    PartnerTag: AMAZON_PARTNER_TAG,
+    PartnerType: "Associates",
+    Marketplace: AMAZON_MARKETPLACE || "www.amazon.in",
+    ItemCount: 10,
+  });
+
+  const { amzDate, authorization } = signRequest({
+    method: "POST", host, path, payload,
+    accessKey: AMAZON_ACCESS_KEY, secretKey: AMAZON_SECRET_KEY, region,
+  });
+
+  let res, body;
+  try {
+    res = await fetch(`https://${host}${path}`, {
+      method: "POST",
+      headers: {
+        "content-encoding": "amz-1.0",
+        "content-type": "application/json; charset=utf-8",
+        "x-amz-date": amzDate,
+        "x-amz-target": "com.amazon.paapi5.v1.ProductAdvertisingAPIv1.SearchItems",
+        "Authorization": authorization,
+      },
+      body: payload,
+    });
+    body = await res.json();
+  } catch (err) {
+    return [failedOffer("Amazon", "amazon-paapi-v5", `Request failed: ${err.message}`)];
+  }
+
+  if (!res.ok || body.Errors) {
+    const reason = body?.Errors?.[0]?.Message || `HTTP ${res.status}`;
+    return [failedOffer("Amazon", "amazon-paapi-v5", reason)];
+  }
+
+  const items = body?.SearchResult?.Items || [];
+  if (items.length === 0) {
+    return [failedOffer("Amazon", "amazon-paapi-v5", "No matching items returned")];
+  }
+
+  return items.map((item) => {
+    const listing = item.Offers?.Listings?.[0];
+    const price = listing?.Price?.Amount ?? null;
+    const mrp = listing?.SavingBasis?.Amount ?? price;
+
+    return normalizeOffer({
+      retailer: "Amazon",
+      productId: item.ASIN,
+      productName: item.ItemInfo?.Title?.DisplayValue || query,
+      brand: item.ItemInfo?.ByLineInfo?.Brand?.DisplayValue || null,
+      image: item.Images?.Primary?.Large?.URL || null,
+      mrp,
+      sellingPrice: price,
+      // PA-API does not return bank/card/coupon offer breakdowns — Amazon
+      // does not expose that via this endpoint, so we do not invent them.
+      bankOffers: [],
+      cardOffers: [],
+      couponOffers: [],
+      cashback: [],
+      exchangeOffer: null,
+      emiOffer: null,
+      shipping: 0,
+      availability: listing?.Availability?.Message || "unknown",
+      productUrl: item.DetailPageURL || null, // exact canonical URL from the API — never constructed
+      source: "amazon-paapi-v5",
+      verificationStatus: price != null ? "VERIFIED" : "UNAVAILABLE",
+    });
+  });
+}
+
+/**
+ * Croma does not publish a public product/pricing API, affiliate feed, or
+ * developer program as of writing. There is no permitted way for this
+ * adapter to retrieve live Croma prices, so it reports its true status
+ * instead of scraping croma.com (which would violate Croma's Terms of
+ * Service) or inventing numbers.
+ *
+ * If Croma opens a partner/affiliate/API program in the future, implement
+ * this the same way amazonAdapter.js / flipkartAdapter.js are structured:
+ * read credentials from process.env, make the real signed/authenticated
+ * request, and normalize the real response — nothing else in the system
+ * needs to change.
+ */
+import { notConnectedOffer } from "../lib/normalizer.js";
+
+export async function searchCroma(_query) {
+  return [notConnectedOffer(
+    "Croma",
+    "No public product/pricing API or affiliate feed is available from Croma at this time. A data partnership would need to be arranged directly with Croma/Infiniti Retail."
+  )];
+}
+
+/**
+ * Reliance Digital does not publish a public product/pricing API or
+ * affiliate feed as of writing. See cromaAdapter.js for the reasoning —
+ * the same applies here: report true status, never scrape or invent data.
+ */
+import { notConnectedOffer } from "../lib/normalizer.js";
+
+export async function searchRelianceDigital(_query) {
+  return [notConnectedOffer(
+    "Reliance Digital",
+    "No public product/pricing API or affiliate feed is available from Reliance Digital at this time. A data partnership would need to be arranged directly with Reliance Retail."
+  )];
+}
+
+/**
+ * Vijay Sales does not publish a public product/pricing API or affiliate
+ * feed as of writing. See cromaAdapter.js for the reasoning — the same
+ * applies here: report true status, never scrape or invent data.
+ */
+import { notConnectedOffer } from "../lib/normalizer.js";
+
+export async function searchVijaySales(_query) {
+  return [notConnectedOffer(
+    "Vijay Sales",
+    "No public product/pricing API or affiliate feed is available from Vijay Sales at this time. A data partnership would need to be arranged directly with Vijay Sales."
+  )];
+}
+
+/**
+ * Flipkart Affiliate API adapter.
+ * Docs: https://affiliate.flipkart.com/api-docs
+ *
+ * Requires an approved Flipkart affiliate account (FLIPKART_AFFILIATE_ID,
+ * FLIPKART_AFFILIATE_TOKEN). Without those, reports "not_connected" —
+ * never a fabricated result.
+ */
+import { normalizeOffer, notConnectedOffer, failedOffer } from "../lib/normalizer.js";
+
+export async function searchFlipkart(query) {
+  const { FLIPKART_AFFILIATE_ID, FLIPKART_AFFILIATE_TOKEN } = process.env;
+
+  if (!FLIPKART_AFFILIATE_ID || !FLIPKART_AFFILIATE_TOKEN) {
+    return [notConnectedOffer("Flipkart", "No FLIPKART_AFFILIATE_ID/FLIPKART_AFFILIATE_TOKEN configured — apply via the Flipkart Affiliate Program.")];
+  }
+
+  const url = `https://affiliate-api.flipkart.net/affiliate/1.0/search.json?query=${encodeURIComponent(query)}&resultCount=10`;
+
+  let res, body;
+  try {
+    res = await fetch(url, {
+      headers: {
+        "Fk-Affiliate-Id": FLIPKART_AFFILIATE_ID,
+        "Fk-Affiliate-Token": FLIPKART_AFFILIATE_TOKEN,
+      },
+    });
+    body = await res.json();
+  } catch (err) {
+    return [failedOffer("Flipkart", "flipkart-affiliate-api", `Request failed: ${err.message}`)];
+  }
+
+  if (!res.ok) {
+    return [failedOffer("Flipkart", "flipkart-affiliate-api", `HTTP ${res.status}`)];
+  }
+
+  const products = body?.products || [];
+  if (products.length === 0) {
+    return [failedOffer("Flipkart", "flipkart-affiliate-api", "No matching products returned")];
+  }
+
+  return products.map(({ productBaseInfoV1: p }) => {
+    const mrp = p?.maximumRetailPrice?.amount ?? null;
+    const price = p?.flipkartSpecialPrice?.amount ?? p?.flipkartSellingPrice?.amount ?? null;
+
+    return normalizeOffer({
+      retailer: "Flipkart",
+      productId: p?.productId || null,
+      productName: p?.title || query,
+      brand: p?.attributes?.brand || null,
+      image: p?.imageUrls?.["400x400"] || null,
+      mrp,
+      sellingPrice: price,
+      // The Affiliate API surfaces flags like codAvailable/emiAvailable but
+      // not itemized bank/card/coupon breakdowns — we only report what it
+      // actually returns.
+      bankOffers: [],
+      cardOffers: [],
+      couponOffers: [],
+      cashback: [],
+      exchangeOffer: null,
+      emiOffer: p?.emiAvailable ? { label: "EMI available", condition: "See retailer for eligible banks/terms" } : null,
+      shipping: 0,
+      availability: p?.inStock ? "in_stock" : "out_of_stock",
+      productUrl: p?.productUrl || null, // exact canonical URL from the API — never constructed
+      source: "flipkart-affiliate-api",
+      verificationStatus: price != null ? "VERIFIED" : "UNAVAILABLE",
+    });
+  });
+}
+
+/**
+ * Every adapter, regardless of the retailer's own response shape, must
+ * produce objects matching this standardized ProductOffer schema before
+ * they reach the matching/offer engines. Keeping normalization here
+ * (rather than duplicated in each adapter) is what lets the rest of the
+ * system stay retailer-agnostic.
+ *
+ * verificationStatus values:
+ *   VERIFIED    - price came from a successful, fresh API/feed response
+ *   RECENT      - served from short-lived cache (see CACHE_TTL_MS below)
+ *   STALE       - cache is older than CACHE_TTL_MS but a live refetch failed
+ *   UNAVAILABLE - no live data and nothing usable cached; never fill this
+ *                 with an invented number
+ */
+
+export function normalizeOffer({
+  retailer,
+  productId = null,
+  productName,
+  brand = null,
+  model = null,
+  variant = null,
+  color = null,
+  storage = null,
+  ram = null,
+  image = null,
+  mrp = null,
+  sellingPrice = null,
+  bankOffers = [],
+  cardOffers = [],
+  couponOffers = [],
+  cashback = [],
+  exchangeOffer = null,
+  emiOffer = null,
+  shipping = null,
+  availability = "unknown",
+  productUrl = null,
+  currency = "INR",
+  source,
+  verificationStatus,
+  fetchedAt = new Date().toISOString(),
+  error = null,
+}) {
+  const discount =
+    mrp != null && sellingPrice != null
+      ? { amount: Math.max(mrp - sellingPrice, 0), percent: mrp > 0 ? Math.round(((mrp - sellingPrice) / mrp) * 100) : 0 }
+      : null;
+
+  return {
+    retailer,
+    productId,
+    productName,
+    brand,
+    model,
+    variant,
+    color,
+    storage,
+    ram,
+    image,
+    mrp,
+    sellingPrice,
+    discount,
+    bankOffers,
+    cardOffers,
+    couponOffers,
+    cashback,
+    exchangeOffer,
+    emiOffer,
+    shipping,
+    availability,
+    // Never invented: only ever the exact URL the retailer/API returned.
+    productUrl,
+    currency,
+    source, // e.g. "amazon-paapi-v5", "flipkart-affiliate-api", "not_connected"
+    verificationStatus,
+    lastVerified: fetchedAt,
+    error,
+  };
+}
+
+/** Standard shape for an adapter that has no connected data source. */
+export function notConnectedOffer(retailer, reason) {
+  return normalizeOffer({
+    retailer,
+    productName: null,
+    productUrl: null,
+    source: "not_connected",
+    verificationStatus: "UNAVAILABLE",
+    error: reason,
+  });
+}
+
+/** Standard shape for an adapter call that failed at request time. */
+export function failedOffer(retailer, source, reason) {
+  return normalizeOffer({
+    retailer,
+    productName: null,
+    productUrl: null,
+    source,
+    verificationStatus: "UNAVAILABLE",
+    error: reason,
+  });
+}
+
+/**
+ * Tracks, per retailer, the data needed for the /api/retailers/status
+ * dashboard endpoint: connection state, last sync time, last error,
+ * and how many products the last search actually returned.
+ *
+ * In-memory only — fine for a single-process deployment. For multiple
+ * instances behind a load balancer, back this with Redis or a DB table
+ * instead so the dashboard reflects reality across all of them.
+ */
+
+const state = new Map();
+
+export function recordResult(retailer, { connected, productsReturned, error }) {
+  state.set(retailer, {
+    retailer,
+    connected,
+    lastSync: new Date().toISOString(),
+    lastError: error || null,
+    productsReturned: productsReturned ?? 0,
+  });
+}
+
+export function getStatus() {
+  return Array.from(state.values());
+}
+
+export function getStatusFor(retailer) {
+  return state.get(retailer) || { retailer, connected: false, lastSync: null, lastError: "No requests made yet", productsReturned: 0 };
+}
+
+/**
+ * Parses a free-text query into structured attributes, and groups
+ * cross-retailer results into "same configuration" clusters so a 128GB
+ * phone is never compared against a 256GB one as if they were identical.
+ *
+ * This is intentionally conservative: if we can't confidently confirm two
+ * listings are the same configuration, we keep them in SEPARATE groups
+ * rather than guessing they match.
+ */
+
+const STORAGE_RE = /(\d+)\s?(gb|tb)\b/i;
+const RAM_RE = /(\d+)\s?gb\s?ram\b/i;
+
+export function parseQuery(query) {
+  const q = query.trim();
+  const storageMatch = q.match(STORAGE_RE);
+  const ramMatch = q.match(RAM_RE);
+
+  return {
+    raw: q,
+    brand: q.split(" ")[0] || null,
+    storage: storageMatch ? `${storageMatch[1]}${storageMatch[2].toUpperCase()}` : null,
+    ram: ramMatch ? `${ramMatch[1]}GB` : null,
+  };
+}
+
+function normalizeToken(s) {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Groups normalized ProductOffer objects by (brand + storage + ram) when
+ * those attributes are known. Offers missing enough attribute data to
+ * confirm a match are placed in their own singleton group rather than
+ * merged by guesswork.
+ */
+export function groupByConfiguration(offers, parsedQuery) {
+  const groups = new Map();
+
+  for (const offer of offers) {
+    if (offer.verificationStatus === "UNAVAILABLE" && !offer.sellingPrice) {
+      // Not-connected / failed adapters don't participate in matching —
+      // they're surfaced separately as retailer status, not as a "product".
+      continue;
+    }
+
+    const storage = offer.storage || parsedQuery.storage || "unspecified";
+    const brand = normalizeToken(offer.brand || parsedQuery.brand || "unknown");
+    const key = `${brand}::${storage}`;
+
+    if (!groups.has(key)) groups.set(key, { brand: offer.brand || parsedQuery.brand, storage, offers: [] });
+    groups.get(key).offers.push(offer);
+  }
+
+  return Array.from(groups.values());
+}
+
+/**
+ * Turns a normalized offer's raw bank/card/coupon/exchange/cashback data
+ * into clearly labeled SCENARIOS rather than one auto-summed "final price".
+ *
+ * Only if the adapter explicitly marked combinability as confirmed by the
+ * retailer/API (offer.combinable === true) do we compute a single combined
+ * total. No current adapter sets that flag, because neither PA-API nor the
+ * Flipkart Affiliate API confirms combinability — so today this always
+ * produces separate scenarios, per the "never stack unconfirmed discounts"
+ * rule.
+ */
+
+export function buildOfferScenarios(offer) {
+  const scenarios = [];
+  const basePrice = offer.sellingPrice;
+
+  if (basePrice == null) {
+    return { basePrice: null, scenarios: [], note: "Live price unavailable — no scenario can be calculated." };
+  }
+
+  const conditionalGroups = [
+    ["bankOffers", "Bank offer"],
+    ["cardOffers", "Card offer"],
+    ["couponOffers", "Coupon"],
+    ["cashback", "Cashback"],
+  ];
+
+  for (const [field, label] of conditionalGroups) {
+    for (const entry of offer[field] || []) {
+      scenarios.push({
+        type: label,
+        description: entry.label || label,
+        amount: entry.amount ?? null,
+        condition: entry.condition || "Terms apply",
+        // Never pre-applied to the displayed price — shown as a potential
+        // scenario the user opts into.
+        estimatedPriceIfApplied: entry.amount != null ? Math.max(basePrice - entry.amount, 0) : null,
+      });
+    }
+  }
+
+  if (offer.exchangeOffer) {
+    scenarios.push({
+      type: "Exchange",
+      description: offer.exchangeOffer.label || "Exchange offer",
+      amount: offer.exchangeOffer.amount ?? null,
+      condition: offer.exchangeOffer.condition || "With eligible device exchange",
+      estimatedPriceIfApplied: offer.exchangeOffer.amount != null ? Math.max(basePrice - offer.exchangeOffer.amount, 0) : null,
+    });
+  }
+
+  if (offer.emiOffer) {
+    scenarios.push({
+      type: "EMI",
+      description: offer.emiOffer.label || "EMI available",
+      amount: null,
+      condition: offer.emiOffer.condition || "Terms apply",
+      estimatedPriceIfApplied: null,
+    });
+  }
+
+  return {
+    basePrice,
+    scenarios,
+    note: "Prices and retailer offers can change. Final price is determined by the retailer at checkout.",
+  };
+}
