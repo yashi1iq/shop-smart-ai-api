@@ -1,91 +1,113 @@
-# Shop Smart AI — prototype (backend + frontend)
+# ShopSmart AI Backend
 
-`frontend/index.html` is the client UI — open it locally or host it anywhere
-static. It has zero price-generation logic of its own; it only calls the
-backend below and shows exactly what it returns, including "not connected"
-and "Live price unavailable" states honestly.
+This backend is designed for the uploaded ShopSmart AI iPhone frontend.
 
+The frontend already expects:
 
-This is a real, deployable backend implementing the retailer-adapter
-architecture: adapters → normalizer → matching engine → offer engine →
-API endpoints. It is **not running anywhere right now** — I can't host a
-persistent server or hold API secrets inside this chat/artifact
-environment, and the sandbox this was written in has no outbound network
-access at all. You (or a developer) need to deploy it somewhere with real
-network access — a small VM, Render, Railway, Fly.io, a serverless
-function, etc.
+`GET /api/search?q=<query>&category=<category>`
 
-## What's actually real here
+and reads offer fields such as title, price, mrp, discount, rating, store, image, url, availability and specs. The frontend currently points at:
 
-- **Amazon adapter** (`adapters/amazonAdapter.js`) — a real, correctly
-  signed PA-API v5 `SearchItems` request (AWS Signature v4, implemented
-  from scratch with Node's `crypto` module — no unverified third-party
-  signing library). It will return real Amazon prices **once you have
-  approved PA-API credentials.**
-- **Flipkart adapter** — a real call to the Flipkart Affiliate API. Same
-  condition: needs an approved affiliate account.
-- **Croma / Reliance Digital / Vijay Sales adapters** — these always
-  return `"not_connected"`. As of writing, none of these three publish a
-  public product/pricing API or affiliate feed. There is nothing to wire
-  up honestly. If one of them opens a partner program later, its adapter
-  slots in the same way `amazonAdapter.js` does.
+`https://shop-smart-ai-api-production.up.railway.app`
 
-## What you need to do to make prices actually appear
+Source: uploaded ShopSmart AI HTML configuration.
 
-1. **Amazon**: Sign up for the Amazon Associates Program (India), then
-   apply for PA-API access from your Associates account
-   (https://webservices.amazon.in/paapi5/documentation/). Amazon approves
-   PA-API access based on your account generating qualifying sales — a
-   brand-new associate account is not guaranteed instant access.
-2. **Flipkart**: Apply for the Flipkart Affiliate Program
-   (https://affiliate.flipkart.com/api-docs) and get your affiliate ID +
-   token.
-3. Copy `.env.example` to `.env` and fill in whichever credentials you
-   actually obtained. Leave the rest blank — those retailers will
-   correctly show as "not connected" instead of the app crashing or
-   guessing.
-4. `npm install && npm start` (or deploy to your platform of choice with
-   the same env vars set in its dashboard/secrets manager).
-5. Point the frontend's `API_BASE_URL` (top of the artifact's `<script>`)
-   at your deployed backend's URL.
+## What is included
 
-## Why Croma / Reliance Digital / Vijay Sales can't be "just added"
+- Express API
+- CORS for mobile/Netlify frontend
+- `/api/health`
+- `/api/search`
+- `/api/stores`
+- Demo data so the app works immediately
+- Optional live shopping provider through SerpApi
+- 2-minute in-memory cache
+- Electronics + beauty queries, with the same API shape
+- Railway-ready `package.json`
+- Environment-variable configuration
 
-Getting their real prices legitimately requires one of:
-- A commercial data-partnership / affiliate agreement directly with the
-  retailer (not something either of us can set up from a chat).
-- Scraping their website — which I won't build, since it's against their
-  Terms of Service regardless of how the request is framed.
+## Important: real store prices
 
-Until one of those changes, the honest state for those three is
-"Data source not connected," not a fake price.
+The backend cannot legally/reliably obtain every retailer's live price simply by opening their websites from JavaScript. Store APIs, affiliate feeds, or a compliant shopping-data provider should be used.
 
-## Endpoints
+This project therefore has two modes:
 
-- `GET /api/search?q=<query>` — runs all adapters, normalizes, groups by
-  configuration (brand + storage), returns real results plus which
-  retailers were unavailable and why.
-- `POST /api/offers/compute` — given one ProductOffer, returns labeled
-  offer *scenarios* (never auto-summed unless the source explicitly
-  confirmed combinability, which neither current adapter does).
-- `GET /api/retailers/status` — connection dashboard: connected/not,
-  last sync, last error, products returned.
-- `GET /api/health` — liveness check.
+### Demo mode
 
-## Caching and freshness
+Default:
 
-Results are cached in-memory for 2 minutes to absorb repeat requests in
-one session — not to serve old data as current. A cached result is
-labeled `RECENT` (not `VERIFIED`); if a live refetch fails and only old
-cache remains, it's labeled `STALE`. The frontend should render these
-statuses visibly rather than treating every response as equally live.
+`DATA_MODE=demo`
 
-## What this does NOT do, on purpose
+The API returns realistic test offers so the frontend can be connected and tested.
 
-- Never invents a price, product URL, or offer.
-- Never bypasses CAPTCHA, bot protection, or authentication.
-- Never stores secrets anywhere the frontend can read them — the
-  frontend only ever talks to this backend, never to a retailer
-  directly.
-- Never auto-stacks bank + coupon + exchange discounts into one number
-  unless a retailer source explicitly says they combine.
+### Live mode
+
+Set:
+
+`DATA_MODE=live`
+
+and:
+
+`SERPAPI_KEY=your_key`
+
+The backend will query the configured shopping provider and normalize the returned results into the exact format used by the frontend.
+
+## Run locally
+
+```bash
+npm install
+npm start
+```
+
+Then open:
+
+`http://localhost:8080/api/health`
+
+Test search:
+
+`http://localhost:8080/api/search?q=iPhone%2016%20Pro&category=electronics`
+
+## Railway deployment
+
+1. Create a GitHub repository, for example `ShopSmartAI-Backend`.
+2. Upload these files.
+3. Create a Railway project from the GitHub repository.
+4. Railway should detect Node automatically.
+5. Add environment variables:
+   - `FRONTEND_ORIGIN=*` for initial testing
+   - `DATA_MODE=demo`
+6. Deploy.
+7. Copy the Railway public URL.
+8. In the ShopSmart AI frontend's Connection Check, set:
+   - Backend URL = your Railway URL
+   - Search path = `/api/search`
+9. Save and retry.
+
+For production, replace `FRONTEND_ORIGIN=*` with your exact Netlify domain.
+
+## Frontend compatibility
+
+The uploaded frontend is already configured for:
+
+- `/api/search`
+- query parameter `q`
+- optional `category`
+- JSON response
+- CORS
+- live polling
+
+The frontend also has a connection-check screen that lets you change the backend URL without editing the HTML.
+
+## Next production upgrades
+
+For truly live retailer-by-retailer prices, add official retailer APIs/affiliate feeds or a licensed shopping-data provider for each store. Do not rely on uncontrolled browser scraping.
+
+Recommended database additions later:
+
+- PostgreSQL for price history
+- Redis for shared caching
+- scheduled workers for price refresh
+- user alerts
+- affiliate click tracking
+- product deduplication
+- retailer-specific adapters
