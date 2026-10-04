@@ -6,11 +6,13 @@ dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
-const SERPAPI_KEY = process.env.SERPAPI_KEY;
+const SCRAPEDO_TOKEN = process.env.SCRAPEDO_TOKEN;
 const DEFAULT_LOCATION = process.env.DEFAULT_LOCATION || "Hyderabad, Telangana, India";
 const DEFAULT_COUNTRY = process.env.DEFAULT_COUNTRY || "in";
 const DEFAULT_LANGUAGE = process.env.DEFAULT_LANGUAGE || "en";
-const CACHE_TTL = Number(process.env.CACHE_TTL_SECONDS || 60) * 1000;
+// Scrape.do costs 10 credits per search, so cache for 24 hours by default
+const CACHE_TTL = Number(process.env.CACHE_TTL_SECONDS || 86400) * 1000;
+const MAX_CACHE = 500;
 
 const allowedOrigins = (process.env.CORS_ORIGINS || "*")
   .split(",").map(s => s.trim()).filter(Boolean);
@@ -24,6 +26,7 @@ app.use(cors({
 app.use(express.json({ limit: "100kb" }));
 
 const cache = new Map();
+const inflight = new Map();
 
 function cleanQuery(value) {
   return String(value || "").trim().replace(/\s+/g, " ").slice(0, 180);
@@ -44,7 +47,7 @@ function discount(price, oldPrice) {
 }
 
 function canonicalStore(source = "") {
-  const s = source.toLowerCase();
+  const s = String(source).toLowerCase();
   if (s.includes("amazon")) return "Amazon";
   if (s.includes("flipkart")) return "Flipkart";
   if (s.includes("croma")) return "Croma";
@@ -71,7 +74,7 @@ function normalizeShoppingResult(item, index) {
   const source = canonicalStore(item.source || item.merchant || item.seller);
   const link = item.link || item.product_link || null;
   return {
-    id: String(item.product_id || item.position || index),
+    id: String(item.catalog_id || item.product_id || item.position || index),
     title: item.title || "Product",
     brand: null,
     price,
@@ -84,7 +87,7 @@ function normalizeShoppingResult(item, index) {
     availText: null,
     store: source,
     delivery: item.delivery || item.shipping || null,
-    image: item.thumbnail || item.serpapi_thumbnail || null,
+    image: item.thumbnail || null,
     url: link,
     specs: Array.isArray(item.extensions) ? item.extensions.slice(0, 6) : []
   };
@@ -113,60 +116,80 @@ function categoryHint(category) {
   return map[category] || "";
 }
 
-async function serpApiSearch(q, category, location) {
-  if (!SERPAPI_KEY) {
-    const err = new Error("SERPAPI_KEY is not configured on the backend.");
+async function fetchScrapeDo(query, location) {
+  const url = new URL("https://api.scrape.do/plugin/google/shopping");
+  url.searchParams.set("token", SCRAPEDO_TOKEN);
+  url.searchParams.set("q", query);
+  url.searchParams.set("gl", DEFAULT_COUNTRY);
+  url.searchParams.set("hl", DEFAULT_LANGUAGE);
+  url.searchParams.set("google_domain", "google.co.in");
+  if (location) url.searchParams.set("location", location);
+
+  const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.error) {
+    const err = new Error(data.message || data.error || `Scrape.do returned HTTP ${response.status}`);
+    err.code = "UPSTREAM_ERROR";
+    throw err;
+  }
+  return Array.isArray(data.shopping_results) ? data.shopping_results : [];
+}
+
+async function shoppingSearch(q, category, location) {
+  if (!SCRAPEDO_TOKEN) {
+    const err = new Error("SCRAPEDO_TOKEN is not configured on the backend.");
     err.code = "MISSING_API_KEY";
     throw err;
   }
 
-  const cacheKey = JSON.stringify({ q, category, location });
+  const cacheKey = JSON.stringify({ q: q.toLowerCase(), category, location });
   const cached = cache.get(cacheKey);
   if (cached && Date.now() - cached.time < CACHE_TTL) return cached.data;
+  if (inflight.has(cacheKey)) return inflight.get(cacheKey);
 
-  const query = [q, categoryHint(category)].filter(Boolean).join(" ").trim();
-  const url = new URL("https://serpapi.com/search.json");
-  url.searchParams.set("engine", "google_shopping");
-  url.searchParams.set("q", query);
-  url.searchParams.set("api_key", SERPAPI_KEY);
-  url.searchParams.set("gl", DEFAULT_COUNTRY);
-  url.searchParams.set("hl", DEFAULT_LANGUAGE);
-  url.searchParams.set("location", location || DEFAULT_LOCATION);
-  url.searchParams.set("device", "mobile");
+  const job = (async () => {
+    const query = [q, categoryHint(category)].filter(Boolean).join(" ").trim();
+    let raw;
+    try {
+      raw = await fetchScrapeDo(query, location);
+      // Scrape.do says an unexpected empty list is transient: retry once
+      if (!raw.length) raw = await fetchScrapeDo(query, location);
+    } catch (err) {
+      // If the service fails but we have an older cached answer, use it
+      if (cached) return cached.data;
+      throw err;
+    }
 
-  const response = await fetch(url);
-  const data = await response.json().catch(() => ({}));
+    const offers = raw
+      .map(normalizeShoppingResult)
+      .filter(x => x.title && x.price != null && x.url)
+      .slice(0, 40);
 
-  if (!response.ok || data.error) {
-    const err = new Error(data.error || `SerpApi returned HTTP ${response.status}`);
-    err.code = "UPSTREAM_ERROR";
-    throw err;
-  }
+    const result = {
+      query: q,
+      category: category || null,
+      location: location || DEFAULT_LOCATION,
+      updatedAt: new Date().toISOString(),
+      count: offers.length,
+      offers
+    };
 
-  const raw = Array.isArray(data.shopping_results) ? data.shopping_results : [];
-  const offers = raw
-    .map(normalizeShoppingResult)
-    .filter(x => x.title && x.price != null && x.url)
-    .slice(0, 40);
+    if (offers.length) {
+      if (cache.size >= MAX_CACHE) cache.delete(cache.keys().next().value);
+      cache.set(cacheKey, { time: Date.now(), data: result });
+    }
+    return result;
+  })().finally(() => inflight.delete(cacheKey));
 
-  const result = {
-    query: q,
-    category: category || null,
-    location: location || DEFAULT_LOCATION,
-    updatedAt: new Date().toISOString(),
-    count: offers.length,
-    offers
-  };
-
-  cache.set(cacheKey, { time: Date.now(), data: result });
-  return result;
+  inflight.set(cacheKey, job);
+  return job;
 }
 
 app.get("/", (_req, res) => {
   res.json({
     name: "ShopSmart AI API",
     status: "ok",
-    version: "1.0.0",
+    version: "1.1.0",
     endpoints: {
       health: "GET /health",
       search: "GET /api/search?q=iPhone%2016%20Pro&category=electronics"
@@ -178,7 +201,7 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "shopsmart-ai-backend",
-    serpapiConfigured: Boolean(SERPAPI_KEY),
+    scrapedoConfigured: Boolean(SCRAPEDO_TOKEN),
     time: new Date().toISOString()
   });
 });
@@ -191,11 +214,12 @@ app.get("/api/search", async (req, res) => {
 
     if (!q) return res.status(400).json({ error: "Missing required query parameter: q" });
 
-    const result = await serpApiSearch(q, category, location);
+    const result = await shoppingSearch(q, category, location);
     res.set("Cache-Control", "no-store");
     res.json(result);
   } catch (error) {
     const status = error.code === "MISSING_API_KEY" ? 503 : 502;
+    console.error("search failed:", error.message);
     res.status(status).json({
       error: error.message || "Search service failed",
       code: error.code || "SEARCH_FAILED"
