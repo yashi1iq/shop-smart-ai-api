@@ -1,0 +1,16 @@
+{
+  "name": "shopsmart-ai-api",
+  "version": "1.0.0",
+  "description": "Backend for ShopSmart AI: price comparison search (Google Shopping via SerpAPI) and YouTube review videos. No runtime dependencies.",
+  "private": true,
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "MOCK=1 node --watch src/server.js",
+    "test": "node --test"
+  }
+}
