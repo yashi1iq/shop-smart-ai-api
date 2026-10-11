@@ -1,4 +1,4 @@
-import { searchAmazon } from '../adapters/amazon.js';
+import { searchAmazon } from './amazon.js';
 
 // Add Flipkart, Croma, Reliance Digital, etc. here: each adapter is (query) => Promise<Product[]>
 const providers = [searchAmazon];
