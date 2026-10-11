@@ -42,8 +42,8 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.get('/api/categories', (_req, res) => res.json(CATEGORIES));
 
 // ---- Search + three-tier picks ----
-app.get('/api/search', wrap(async (req, res) => {
-  const q = str(req.query.q, 100).trim();
+app.get(['/api/search', '/search', '/api/products/search'], wrap(async (req, res) => {
+  const q = str(req.query.q ?? req.query.query ?? req.query.search ?? req.query.keyword ?? req.query.name, 100).trim();
   if (q.length < 2) return bad(res, 'q is required');
   const budget = pos(req.query.budget) || parseBudget(q);
   const term = searchTerm(q);
