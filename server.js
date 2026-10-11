@@ -2,14 +2,14 @@ import express from 'express';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import crypto from 'node:crypto';
-import db, { save } from './lib/store.js';
-import { CATEGORIES } from './lib/categories.js';
-import { cached } from './lib/cache.js';
-import { searchAll } from './lib/search.js';
-import { parseBudget, searchTerm, pickTiers } from './lib/tiers.js';
-import { youtubeReviews } from './lib/youtube.js';
-import { askRiya } from './lib/riya.js';
-import { checkAlerts, vapidPublicKey } from './lib/alerts.js';
+import db, { save } from './store.js';
+import { CATEGORIES } from './categories.js';
+import { cached } from './cache.js';
+import { searchAll } from './search.js';
+import { parseBudget, searchTerm, pickTiers } from './tiers.js';
+import { youtubeReviews } from './youtube.js';
+import { askRiya } from './riya.js';
+import { checkAlerts, vapidPublicKey } from './alerts.js';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -67,8 +67,8 @@ app.get('/api/deals', (_req, res) => res.json(SEEDS.map(([title, category, price
   title, category, price, mrp: Math.round(price * 1.3), discount: 23, sample: true, query: title
 }))));
 
-app.get('/api/reviews', wrap(async (req, res) => {
-  const q = str(req.query.q, 100).trim();
+app.get(['/api/reviews', '/api/youtube-reviews'], wrap(async (req, res) => {
+  const q = str(req.query.q ?? req.query.query ?? req.query.product ?? req.query.title, 100).trim();
   if (q.length < 2) return bad(res, 'q is required');
   res.json(await cached(`y:${q.toLowerCase()}`, 24 * 3600_000, () => youtubeReviews(q)));
 }));
