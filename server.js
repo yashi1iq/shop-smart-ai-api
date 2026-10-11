@@ -13,7 +13,8 @@ import { checkAlerts, vapidPublicKey } from './alerts.js';
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(cors(process.env.ALLOWED_ORIGINS ? { origin: process.env.ALLOWED_ORIGINS.split(',') } : {}));
+const origins = (process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
+app.use(cors(origins.length && !origins.includes('*') ? { origin: origins } : {})); // blank or * = allow all sites
 app.use(express.json({ limit: '100kb' }));
 app.use('/api', rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: true, legacyHeaders: false }));
 
@@ -151,3 +152,7 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`ShopSmart API on :${port}`));
 const hours = Number(process.env.ALERT_INTERVAL_HOURS) || 6;
 setInterval(() => checkAlerts().catch((e) => console.error('alerts', e.message)), hours * 3600_000);
+
+// Log unexpected errors instead of letting one bad request take the whole API down.
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e?.stack || e));
+process.on('uncaughtException', (e) => console.error('uncaughtException:', e?.stack || e));
