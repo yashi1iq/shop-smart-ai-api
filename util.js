@@ -1,50 +1,99 @@
-export class Skip extends Error {}   // provider not configured / budget used: not an error
+export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export const num = v => {
-  if (v == null) return null;
-  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-  if (typeof v === 'object') { for (const k of ['value', 'amount', 'current', 'selling', 'price', 'lowPrice']) if (v[k] != null) { const n = num(v[k]); if (n != null) return n; } return null; }
-  const m = String(v).replace(/,/g, '').match(/\d+(?:\.\d+)?/);
-  return m ? parseFloat(m[0]) : null;
-};
+const NAMED = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', rupee: '₹' };
+export function decodeEntities(s) {
+  return String(s ?? '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => safeChr(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => safeChr(parseInt(d, 10)))
+    .replace(/&([a-z]+);/gi, (m, n) => NAMED[n.toLowerCase()] ?? m);
+}
+function safeChr(n) {
+  try { return String.fromCodePoint(n); } catch { return ''; }
+}
 
-export const absUrl = (u, base) => {
-  if (!u || typeof u !== 'string') return null;
-  try { const x = new URL(u.startsWith('//') ? 'https:' + u : u, base); return /^https?:$/.test(x.protocol) ? x.href : null; } catch { return null; }
-};
+export const clean = (s) => decodeEntities(s).replace(/\s+/g, ' ').trim();
 
-/* One normalised offer in the exact shape the app reads. Returns null for unusable rows. */
-export function offer(o) {
-  const title = String(o.title || '').replace(/\s+/g, ' ').trim();
-  const price = num(o.price);
-  if (!title || title.length < 3 || price == null || price <= 0) return null;
-  const mrp0 = num(o.mrp), mrp = mrp0 && mrp0 > price ? mrp0 : null;
-  let rating = num(o.rating); if (rating != null && (rating <= 0 || rating > 5)) rating = null;
-  const dp = mrp ? Math.round((mrp - price) / mrp * 100) : (num(o.discountPercent) || null);
-  return {
-    title: title.slice(0, 200), brand: o.brand || null, price: Math.round(price * 100) / 100, mrp,
-    discountPercent: dp && dp > 0 && dp < 100 ? dp : null, currency: 'INR', rating,
-    reviews: num(o.reviews), inStock: typeof o.inStock === 'boolean' ? o.inStock : null,
-    store: o.store, storeId: o.storeId, delivery: o.delivery || null, image: o.image || null,
-    url: o.url || null, specs: Array.isArray(o.specs) ? o.specs.filter(Boolean).map(s => String(s).slice(0, 80)).slice(0, 4) : []
+/* Visible text of an HTML fragment, one logical element per line. */
+export function textLines(html) {
+  return decodeEntities(
+    String(html ?? '')
+      .replace(/<(script|style|noscript|svg)\b[\s\S]*?<\/\1>/gi, '\n')
+      .replace(/<[^>]*>/g, '\n'),
+  )
+    .split(/\n+/)
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+}
+
+/* "₹1,29,900.00" -> 129900 */
+export function parsePrice(s) {
+  if (s == null) return null;
+  const m = String(s).replace(/,/g, '').match(/\d+(?:\.\d+)?/);
+  if (!m) return null;
+  const n = Math.round(parseFloat(m[0]));
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/* "12,345" -> 12345, "1.2K" -> 1200, "(3M)" -> 3000000 */
+export function parseCount(s) {
+  const t = String(s ?? '').replace(/[(),\s]/g, '').toLowerCase();
+  const m = t.match(/^(\d+(?:\.\d+)?)([km])?\+?/);
+  if (!m) return null;
+  const mult = m[2] === 'k' ? 1e3 : m[2] === 'm' ? 1e6 : 1;
+  return Math.round(parseFloat(m[1]) * mult);
+}
+
+export function attr(tag, name) {
+  const m = String(tag ?? '').match(new RegExp(`\\b${name}\\s*=\\s*("([^"]*)"|'([^']*)')`, 'i'));
+  return m ? decodeEntities(m[2] ?? m[3]) : null;
+}
+
+/* Common brands, used only to fill the `brand` field when the title starts with one. */
+const BRANDS = [
+  'Apple', 'Samsung', 'Google', 'OnePlus', 'Sony', 'LG', 'Dell', 'HP', 'Lenovo', 'Asus', 'Acer', 'MSI', 'Canon', 'Nikon',
+  'Maybelline', 'Lakme', 'Nivea', 'Cetaphil', 'Neutrogena', 'Minimalist', 'Garnier', 'Olay', 'Clinique', 'Mamaearth',
+  'Revlon', 'Dyson', 'Philips', 'Xiaomi', 'Redmi', 'Realme', 'Poco', 'Vivo', 'Oppo', 'Motorola', 'Nothing', 'iQOO',
+  'boAt', 'JBL', 'Bose', 'Noise', 'Sennheiser', "Levi's", 'Nike', 'Adidas', 'Puma', 'Crocs', 'Skechers', 'Bata',
+  'LEGO', 'Fastrack', 'Titan', 'Casio', 'Fossil', 'Funko', 'Prestige', 'Bajaj', 'Havells', 'Whirlpool', 'Voltas',
+  'Panasonic', 'Godrej', 'IFB', 'Bosch', 'Haier', 'TCL', 'Hisense', 'Mi', 'GoPro', 'Fujifilm', 'Kindle', 'Amazon',
+];
+const BRAND_MAP = new Map(BRANDS.map((b) => [b.toLowerCase(), b]));
+export function guessBrand(title) {
+  const words = String(title ?? '').trim().split(/\s+/).slice(0, 3);
+  for (const w of words) {
+    const b = BRAND_MAP.get(w.toLowerCase().replace(/[^a-z0-9']/g, ''));
+    if (b) return b;
+  }
+  return null;
+}
+
+export function makeOffer({ store, title, price, mrp, rating, reviews, image, url, delivery, specs, inStock = true, availText }) {
+  const p = price ?? null;
+  const m = mrp && p && mrp > p ? mrp : null;
+  const out = {
+    title: String(title || '').trim(),
+    brand: guessBrand(title),
+    price: p,
+    mrp: m,
+    discount: m ? Math.round(((m - p) / m) * 100) : null,
+    currency: 'INR',
+    rating: rating != null && rating > 0 && rating <= 5 ? Math.round(rating * 10) / 10 : null,
+    reviews: reviews ?? null,
+    inStock,
+    availText: availText || (inStock ? 'In stock' : 'Out of stock'),
+    store,
+    delivery: delivery || null,
+    image: image || null,
+    url: url || null,
+    specs: Array.isArray(specs) ? specs.slice(0, 4) : [],
   };
+  return out;
 }
 
-export const withTimeout = (p, ms, label) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(label + ' timed out')), ms))]);
-
-export async function fetchJson(url, opts = {}, ms = 20000) {
-  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms);
-  try {
-    const r = await fetch(url, { ...opts, signal: ctl.signal });
-    const text = await r.text();
-    if (!r.ok) throw new Error(`HTTP ${r.status} ${text.slice(0, 160)}`);
-    try { return JSON.parse(text); } catch { throw new Error('reply was not JSON'); }
-  } finally { clearTimeout(t); }
+export function cleanQuery(raw) {
+  return String(raw ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
 }
-
-export const relevant = (title, q) => {
-  const toks = String(q).toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 3);
-  if (!toks.length) return true;
-  const t = title.toLowerCase();
-  return toks.some(k => t.includes(k));
-};
