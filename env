@@ -20,8 +20,8 @@ AMAZON_UPSTREAM_KEY=
 FLIPKART_AFFILIATE_ID=
 FLIPKART_AFFILIATE_TOKEN=
 
-# ---------- ScrapingBee (stores with no API) ----------
-SCRAPINGBEE_API_KEY=
+# ---------- ZENROWS (stores with no API) ----------
+ZENROWS _API_KEY=
 SCRAPINGBEE_DAILY_CREDITS=7000   # ~ monthly credits / 30, minus a safety margin
 # Optional per-store CSS rules, see README. Example:
 # STORE_RULES_JSON={"snp":{"item":".product-tuple-listing","fields":{"title":".product-title","price":".product-price"}}}
