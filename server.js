@@ -1,6 +1,6 @@
 import { config } from './config.js';
 import { createApp } from './app.js';
-import { enabledStores } from './src/stores/index.js';
+import { enabledStores } from './stores/index.js';
 
 const server = createApp();
 /* Searches can take a while; do not let Node cut the socket before our own time budget does. */
