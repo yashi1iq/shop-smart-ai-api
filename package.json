@@ -1,0 +1,16 @@
+{
+  "name": "shopsmart-ai-backend",
+  "version": "1.0.0",
+  "description": "ShopSmart AI price-comparison backend powered by ZenRows",
+  "main": "server.js",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.18"
+  }
+}
