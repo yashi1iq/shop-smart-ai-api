@@ -1,4 +1,4 @@
-import { config } from './src/config.js';
+import { config } from ./config.js';
 import { createApp } from './src/app.js';
 import { enabledStores } from './src/stores/index.js';
 
