@@ -1,1 +1,1 @@
-export * from ',/zenrows.js';
+export * from './zenrows.js';
